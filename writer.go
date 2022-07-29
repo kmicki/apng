@@ -27,6 +27,12 @@ type Encoder struct {
 	BufferPool EncoderBufferPool
 }
 
+type FrameByFrameEncoder struct {
+	Encoder  *EncoderBuffer
+	FrameCnt uint32
+	Started  bool
+}
+
 // EncoderBufferPool is an interface for getting and returning temporary
 // instances of the EncoderBuffer struct. This can be used to reuse buffers
 // when encoding multiple images.
@@ -171,8 +177,8 @@ func (e *encoder) writeIHDR() {
 	e.writeChunk(e.tmp[:13], "IHDR")
 }
 
-func (e *encoder) writeacTL() {
-	binary.BigEndian.PutUint32(e.tmp[0:4], uint32(len(e.a.Frames)))
+func (e *encoder) writeacTL(frameCnt uint32) {
+	binary.BigEndian.PutUint32(e.tmp[0:4], uint32(frameCnt))
 	binary.BigEndian.PutUint32(e.tmp[4:8], uint32(e.a.LoopCount))
 	e.writeChunk(e.tmp[:8], "acTL")
 }
@@ -614,16 +620,48 @@ func Encode(w io.Writer, a APNG) error {
 	return e.Encode(w, a)
 }
 
-// Encode writes the Animation a to w in PNG format.
-func (enc *Encoder) Encode(w io.Writer, a APNG) error {
-	// Obviously, negative widths and heights are invalid. Furthermore, the PNG
-	// spec section 11.2.2 says that zero is invalid. Excessively large images are
-	// also rejected.
-	mw, mh := int64(a.Frames[0].Image.Bounds().Dx()), int64(a.Frames[0].Image.Bounds().Dy())
-	if mw <= 0 || mh <= 0 || mw >= 1<<32 || mh >= 1<<32 {
-		return FormatError("invalid image size: " + strconv.FormatInt(mw, 10) + "x" + strconv.FormatInt(mh, 10))
+// Call to initialize frame-by-frame encoding. Returns Encoder to use with
+// remaining frame-by-frame functions
+func InitializeEncoding(w io.Writer, frameCnt uint32, loopCount uint) *FrameByFrameEncoder {
+	var e Encoder
+	return &FrameByFrameEncoder{
+		Encoder:  (*EncoderBuffer)(e.Initialize(w, loopCount)),
+		FrameCnt: frameCnt,
+		Started:  false,
+	}
+}
+
+// Encode frame
+func (enc *FrameByFrameEncoder) EncodeFrame(frm Frame) error {
+	e := (*encoder)(enc.Encoder)
+
+	if !enc.Started {
+		e.a.Frames = append(e.a.Frames, frm)
+
+		err := e.FirstFrame(frm, enc.FrameCnt, true)
+		if err != nil {
+			return err
+		}
+		if e.err != nil {
+			return e.err
+		}
+
+		enc.Started = true
+		return nil
 	}
 
+	e.NextFrame(frm)
+	return e.err
+}
+
+// Finish encoding
+func (enc *FrameByFrameEncoder) Finish() error {
+	(*encoder)(enc.Encoder).Finish()
+	return enc.Encoder.err
+}
+
+// Initialize encoding
+func (enc *Encoder) Initialize(w io.Writer, loopCount uint, a ...APNG) *encoder {
 	var e *encoder
 	if enc.BufferPool != nil {
 		buffer := enc.BufferPool.Get()
@@ -639,12 +677,33 @@ func (enc *Encoder) Encode(w io.Writer, a APNG) error {
 
 	e.enc = enc
 	e.w = w
-	e.a = a
+	if len(a) > 0 {
+		e.a = a[0]
+	} else {
+		e.a = APNG{
+			LoopCount: loopCount,
+		}
+	}
+	return e
+}
+
+// Further initialization based on the first frame.
+// Including encoding of the first frame.
+func (e *encoder) FirstFrame(frm Frame, frameCnt uint32, allOpaque bool) error {
+	// Obviously, negative widths and heights are invalid. Furthermore, the PNG
+	// spec section 11.2.2 says that zero is invalid. Excessively large images are
+	// also rejected.
+	mw, mh := int64(frm.Image.Bounds().Dx()), int64(frm.Image.Bounds().Dy())
+	if mw <= 0 || mh <= 0 || mw >= 1<<32 || mh >= 1<<32 {
+		return FormatError("invalid image size: " + strconv.FormatInt(mw, 10) + "x" + strconv.FormatInt(mh, 10))
+	}
+
+	w := e.w
 
 	var pal color.Palette
 	// cbP8 encoding needs PalettedImage's ColorIndexAt method.
-	if _, ok := a.Frames[0].Image.(image.PalettedImage); ok {
-		pal, _ = a.Frames[0].Image.ColorModel().(color.Palette)
+	if _, ok := frm.Image.(image.PalettedImage); ok {
+		pal, _ = frm.Image.ColorModel().(color.Palette)
 	}
 	if pal != nil {
 		if len(pal) <= 2 {
@@ -657,33 +716,19 @@ func (enc *Encoder) Encode(w io.Writer, a APNG) error {
 			e.cb = cbP8
 		}
 	} else {
-		switch a.Frames[0].Image.ColorModel() {
+		switch frm.Image.ColorModel() {
 		case color.GrayModel:
 			e.cb = cbG8
 		case color.Gray16Model:
 			e.cb = cbG16
 		case color.RGBAModel, color.NRGBAModel, color.AlphaModel:
-			isOpaque := true
-			for _, v := range a.Frames {
-				if !opaque(v.Image) {
-					isOpaque = false
-					break
-				}
-			}
-			if isOpaque {
+			if allOpaque {
 				e.cb = cbTC8
 			} else {
 				e.cb = cbTCA8
 			}
 		default:
-			isOpaque := true
-			for _, v := range a.Frames {
-				if !opaque(v.Image) {
-					isOpaque = false
-					break
-				}
-			}
-			if isOpaque {
+			if allOpaque {
 				e.cb = cbTC16
 			} else {
 				e.cb = cbTCA16
@@ -697,18 +742,52 @@ func (enc *Encoder) Encode(w io.Writer, a APNG) error {
 		e.writePLTEAndTRNS(pal)
 	}
 	if len(e.a.Frames) > 1 {
-		e.writeacTL()
+		e.writeacTL(uint32(len(e.a.Frames)))
+	} else if frameCnt > 1 {
+		e.writeacTL(frameCnt)
 	}
-	if !e.a.Frames[0].IsDefault {
-		e.writefcTL(e.a.Frames[0])
+	if !frm.IsDefault {
+		e.writefcTL(frm)
 	}
 	e.writeIDATs()
-	for i := 0; i < len(e.a.Frames); i = i + 1 {
-		if i != 0 && !e.a.Frames[i].IsDefault {
-			e.writefcTL(e.a.Frames[i])
-			e.writefdATs(e.a.Frames[i])
+
+	return nil
+}
+
+// Encode next frame
+func (e *encoder) NextFrame(frm Frame) {
+	e.writefcTL(frm)
+	e.writefdATs(frm)
+}
+
+// Finish encoding
+func (e *encoder) Finish() {
+	e.writeIEND()
+}
+
+// Encode writes the Animation a to w in PNG format.
+func (enc *Encoder) Encode(w io.Writer, a APNG) error {
+
+	e := enc.Initialize(w, a.LoopCount, a)
+
+	isOpaque := true
+	for _, v := range a.Frames {
+		if !opaque(v.Image) {
+			isOpaque = false
+			break
 		}
 	}
-	e.writeIEND()
+
+	err := e.FirstFrame(e.a.Frames[0], uint32(len(e.a.Frames)), isOpaque)
+	if err != nil {
+		return err
+	}
+
+	for i := 0; i < len(e.a.Frames); i = i + 1 {
+		if i != 0 && !e.a.Frames[i].IsDefault {
+			e.NextFrame(e.a.Frames[i])
+		}
+	}
+	e.Finish()
 	return e.err
 }
