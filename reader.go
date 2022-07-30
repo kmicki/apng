@@ -55,6 +55,10 @@ func cbPaletted(cb int) bool {
 	return cbP1 <= cb && cb <= cbP8
 }
 
+func cbTrueColor(cb int) bool {
+	return cb == cbTC8 || cb == cbTCA8 || cb == cbTC16 || cb == cbTCA16
+}
+
 // Filter type, as per the PNG spec.
 const (
 	ftNone    = 0
@@ -968,10 +972,17 @@ func (d *decoder) parseChunk() error {
 			return chunkOrderError
 		}
 		d.stage = dsSeenPLTE
-		return d.parsePLTE(length)
+		if cbPaletted(d.cb) {
+			return d.parsePLTE(length)
+		}
+		return nil
 	case "tRNS":
 		if cbPaletted(d.cb) {
 			if d.stage != dsSeenPLTE {
+				return chunkOrderError
+			}
+		} else if cbTrueColor(d.cb) {
+			if d.stage != dsSeenPLTE && d.stage != dsSeenIHDR {
 				return chunkOrderError
 			}
 		} else if d.stage != dsSeenIHDR {
