@@ -638,7 +638,7 @@ func (enc *FrameByFrameEncoder) EncodeFrame(frm Frame) error {
 	if !enc.Started {
 		e.a.Frames = append(e.a.Frames, frm)
 
-		err := e.FirstFrame(frm, enc.FrameCnt, true)
+		err := e.FirstFrame(frm, enc.FrameCnt, false)
 		if err != nil {
 			return err
 		}
